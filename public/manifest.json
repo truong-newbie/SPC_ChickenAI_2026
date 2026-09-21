@@ -1,0 +1,21 @@
+{
+  "name": "FileBridge",
+  "short_name": "FileBridge",
+  "description": "Nền tảng chuyển file bảo mật P2P đầu cuối",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0ea5e9",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
