@@ -235,7 +235,7 @@ class RoomBasedService {
         { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
       ],
       iceCandidatePoolSize: 10,
-      iceTransportPolicy: 'relay', // Prefer relay to avoid NAT issues
+      iceTransportPolicy: 'all', // Try all candidate types
       bundlePolicy: 'max-bundle',
     });
 
