@@ -1,7 +1,7 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useState, useRef } from 'react';
 
 interface FileDropzoneProps {
-  onFilesSelected: (files: File[]) => void;
+  onFilesSelected: (items: (File | DataTransferItem)[]) => void;
   disabled?: boolean;
 }
 
@@ -10,6 +10,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
   disabled = false,
 }) => {
   const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -33,7 +34,17 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
 
       if (disabled) return;
 
-      const files = Array.from(e.dataTransfer.files);
+      // Lấy tất cả items (files + directories)
+      const items = Array.from(e.dataTransfer.items);
+      const files: (File | DataTransferItem)[] = [];
+
+      for (const item of items) {
+        if (item.kind === 'file') {
+          // DataTransferItem để giữ được thông tin thư mục
+          files.push(item);
+        }
+      }
+
       if (files.length > 0) {
         onFilesSelected(files);
       }
@@ -43,7 +54,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
 
   const handleFileInput = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []);
+      const files = Array.from(e.target.files || []).map(f => f as File);
       if (files.length > 0) {
         onFilesSelected(files);
       }
@@ -51,6 +62,12 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
     },
     [onFilesSelected]
   );
+
+  const handleClick = useCallback(() => {
+    if (!disabled) {
+      fileInputRef.current?.click();
+    }
+  }, [disabled]);
 
   return (
     <div
@@ -65,9 +82,10 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      onClick={() => !disabled && document.getElementById('file-input')?.click()}
+      onClick={handleClick}
     >
       <input
+        ref={fileInputRef}
         type="file"
         id="file-input"
         className="hidden"
@@ -105,12 +123,28 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
           </p>
         </div>
 
-        <p className="text-xs text-gray-400 dark:text-gray-500">
-          Không giới hạn kích thước file • Mã hóa E2E
+        {/* Supported formats */}
+        <div className="flex flex-wrap justify-center gap-2 mt-2">
+          <FormatBadge icon="📁" text="Thư mục" />
+          <FormatBadge icon="🖼️" text="Ảnh" />
+          <FormatBadge icon="📄" text="Tài liệu" />
+          <FormatBadge icon="🎬" text="Video" />
+          <FormatBadge icon="💾" text="Mọi file" />
+        </div>
+
+        <p className="text-xs text-gray-400 dark:text-gray-500 mt-2">
+          Không giới hạn kích thước • Mã hóa E2E
         </p>
       </div>
     </div>
   );
 };
+
+const FormatBadge: React.FC<{ icon: string; text: string }> = ({ icon, text }) => (
+  <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-700 text-xs text-gray-600 dark:text-gray-300">
+    <span>{icon}</span>
+    <span>{text}</span>
+  </span>
+);
 
 export default FileDropzone;

@@ -8,126 +8,131 @@
 - **E2E Encryption**: Mã hóa AES-256-GCM với ECDH key exchange
 - **Cross-Network**: Hỗ trợ truyền qua Internet toàn cầu, không chỉ cùng mạng LAN
 - **Anonymous Mode**: Không cần đăng ký, chỉ cần tạo/join phòng bằng mã 6 ký tự
+- **Drag & Drop**: Hỗ trợ thư mục, ảnh, mọi loại file
 - **Web App PWA**: Chạy trên trình duyệt, responsive, hoạt động offline
-- **Drag & Drop**: Giao diện kéo thả file với progress bar real-time
+- **Multi-fallback**: Tự động chuyển sang WebSocket → HTTP khi WebRTC bị chặn
 
-## Kiến trúc
+## Kiến trúc Hybrid Transfer
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    FileBridge Architecture                   │
+│                    Connection Flow                            │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  🔒 MÁY GỬI (Sender)          🔓 MÁY NHẬN (Receiver)      │
-│  ┌─────────────────┐        ┌─────────────────┐         │
-│  │ 1. Chọn file    │        │ 1. Tham gia phòng│         │
-│  │ 2. Mã hóa       │ ───▶  │ 2. Chờ nhận     │         │
-│  │    AES-256-GCM  │  P2P   │ 3. Giải mã       │         │
-│  │ 3. Truyền qua   │ WebRTC │ 4. Lưu file      │         │
-│  │    DataChannel  │        │                  │         │
-│  └─────────────────┘        └─────────────────┘         │
+│  1. THỬ WebRTC P2P (ưu tiên)                              │
+│     └─> STUN Server (Google) → Kết nối trực tiếp           │
 │                                                             │
-│              Signaling Server (chỉ relay metadata)          │
-│              - SDP offer/answer                             │
-│              - ICE candidates                               │
-│              - KHÔNG chạm vào nội dung file                │
+│  2. THỬ Local PeerJS Server (không cần Internet)          │
+│     └─> Cùng LAN → Hoạt động không cần mạng                │
+│                                                             │
+│  3. THỬ WebSocket Relay (TCP fallback)                     │
+│     └─> Khi UDP bị chặn → Dùng port 80/443                 │
+│                                                             │
+│  4. HTTP Upload (emergency backup)                          │
+│     └─> Khi mọi thứ fail → Relay qua HTTP                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Security Model                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  🔒 Server chỉ relay metadata (SDP, ICE)                   │
+│  🔒 KHÔNG BAO GIỜ chạm vào nội dung file                    │
+│  🔒 KHÔNG lưu trữ file trên server                        │
+│  🔒 KHÔNG dùng Redis - chỉ in-memory                       │
+│  🔒 KHÔNG database - session không cần lưu               │
+│                                                             │
+│  ✅ AES-256-GCM mã hóa file trước khi gửi                 │
+│  ✅ ECDH key exchange - key chỉ có sender/receiver biết    │
+│  ✅ Perfect Forward Secrecy - mỗi phiên dùng key khác nhau   │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Công nghệ sử dụng
 
-### Frontend
-- **React 18** + TypeScript + Vite
-- **Tailwind CSS** cho styling
-- **PeerJS** cho WebRTC
-- **Zustand** cho state management
-- **Web Crypto API** cho E2E encryption
-
-### Backend (Signaling Server)
-- **Node.js** + Express + Socket.IO
-- **STUN Server**: Google STUN (miễn phí)
+| Lớp | Công nghệ |
+|------|-----------|
+| **Frontend** | React 18 + TypeScript + Vite + Tailwind CSS |
+| **P2P Engine** | PeerJS (WebRTC) + Web Crypto API |
+| **Signaling** | Socket.IO WebSocket (in-memory, không Redis) |
+| **State** | Zustand |
+| **STUN** | Google STUN + Open Relay Project (miễn phí) |
 
 ## Cài đặt
 
-### Yêu cầu
-- Node.js 18+
-- npm hoặc yarn
-
-### Clone và cài đặt
-
 ```bash
-# Clone repository
-git clone <repo-url>
+# 1. Cài frontend
 cd filebridge-mvp
-
-# Cài đặt dependencies cho frontend
 npm install
 
-# Cài đặt dependencies cho signaling server
+# 2. Cài signaling server
 cd server
 npm install
-cd ..
 ```
 
-### Chạy ứng dụng
+## Chạy ứng dụng
 
 ```bash
-# Terminal 1: Chạy signaling server
+# Terminal 1: Signaling Server (luôn chạy trước)
 cd server
 npm start
 
-# Terminal 2: Chạy frontend
+# Terminal 2: Frontend
+cd ..
 npm run dev
 ```
 
 Truy cập http://localhost:3000
 
-## Sử dụng
+## Demo không cần Internet
 
-### Tạo phòng mới (Người gửi)
-1. Nhấn "Tạo phòng mới"
-2. Copy mã phòng 6 ký tự
-3. Chia sẻ mã cho người nhận
-4. Kéo thả file vào khung để gửi
+```bash
+# Trên máy presenter, chạy signaling server
+cd server
+npm start
 
-### Tham gia phòng (Người nhận)
-1. Nhấn "Tham gia phòng"
-2. Nhập mã phòng 6 ký tự
-3. File sẽ được nhận tự động khi người gửi gửi
+# Trên cùng LAN, mọi người truy cập:
+# http://<ip-may-presenter>:3000
 
-## Bảo mật
+# App sẽ tự kết nối Local PeerJS Server thay vì PeerJS Cloud
+```
 
-- **AES-256-GCM**: Mã hóa nội dung file
-- **ECDH Key Exchange**: Trao đổi khóa an toàn
-- **Perfect Forward Secrecy**: Mỗi phiên dùng ephemeral key khác nhau
-- **HMAC-SHA256**: Kiểm tra toàn vẹn dữ liệu
-- **Không lưu trữ file**: File chỉ tồn tại trên 2 thiết bị
+## Hỗ trợ nhiều loại file
 
-## Demo cho Hackathon
+| Loại | Ví dụ |
+|------|--------|
+| **Thư mục** | Kéo thả cả thư mục vào |
+| **Ảnh** | JPG, PNG, GIF, WebP, SVG |
+| **Video** | MP4, MOV, AVI, WebM |
+| **Tài liệu** | PDF, DOC, DOCX, XLS, XLSX |
+| **Mọi file** | Không giới hạn định dạng |
 
-Để demo trên sân khấu (không cần Internet):
+## Chi phí
 
-1. Máy presenter chạy web app
-2. Giám khảo + khán giả truy cập cùng WiFi
-3. Trong cùng LAN, WebRTC P2P hoạt động 100%
-4. Không cần STUN/TURN server
+| Dịch vụ | Chi phí | Ghi chú |
+|---------|---------|----------|
+| Signaling Server | $0 | Tự host, dùng local cho demo |
+| STUN Server | $0 | Google + Open Relay miễn phí |
+| Hosting | $0 | Vercel/Netlify free tier |
+
+**Tổng: $0**
 
 ## Roadmap
 
 ### Phase 1 (Sau Hackathon)
 - [ ] Ổn định Web App, fix bugs
-- [ ] Collect feedback từ 100-500 user đầu tiên
+- [ ] Collect feedback từ user đầu tiên
 
 ### Phase 2 (3-6 tháng)
-- [ ] Android App
-- [ ] iOS App
-- [ ] Subdomain branding cho Pro user
+- [ ] Android/iOS App
+- [ ] Subdomain branding
 - [ ] Analytics dashboard
 
 ### Phase 3 (6-12 tháng)
 - [ ] API for developers
 - [ ] Enterprise features (SSO, audit log)
-- [ ] White-label solution
 
 ## Giấy phép
 

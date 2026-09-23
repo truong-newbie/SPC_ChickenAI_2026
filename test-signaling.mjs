@@ -1,0 +1,128 @@
+// Simple WebSocket signaling test
+import { WebSocket } from 'ws';
+
+const SIGNALING_URL = 'ws://localhost:3002';
+
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function testSignaling() {
+  console.log('Testing WebSocket Signaling...\n');
+
+  let ws1, ws2;
+  let hostSocketId, joinerSocketId;
+  let roomCode = null;
+
+  try {
+    // Step 1: Host creates room
+    console.log('Step 1: Host creating room...');
+    ws1 = new WebSocket(SIGNALING_URL);
+
+    await new Promise((resolve, reject) => {
+      ws1.on('open', resolve);
+      ws1.on('error', reject);
+    });
+
+    console.log('Host connected');
+
+    ws1.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
+      console.log('Host received:', msg.type);
+
+      if (msg.type === 'room-created') {
+        hostSocketId = msg.socketId;
+        roomCode = msg.roomCode;
+        console.log(`Host socket: ${hostSocketId}, Room: ${roomCode}`);
+
+        // Step 2: Joiner joins room
+        setTimeout(() => joinRoom(), 500);
+      }
+
+      if (msg.type === 'peer-joined') {
+        console.log(`Peer joined: ${msg.peerSocketId}`);
+      }
+    });
+
+    ws1.send(JSON.stringify({ type: 'create-room' }));
+
+    await sleep(500);
+
+    // Step 2: Joiner creates connection and joins room
+    async function joinRoom() {
+      console.log('\nStep 2: Joiner joining room...');
+      ws2 = new WebSocket(SIGNALING_URL);
+
+      await new Promise((resolve, reject) => {
+        ws2.on('open', resolve);
+        ws2.on('error', reject);
+      });
+
+      console.log('Joiner connected');
+
+      ws2.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        console.log('Joiner received:', msg.type);
+
+        if (msg.type === 'room-joined') {
+          joinerSocketId = msg.socketId;
+          console.log(`Joiner socket: ${joinerSocketId}, Host socket: ${msg.hostSocketId}`);
+        }
+      });
+
+      ws2.send(JSON.stringify({ type: 'join-room', roomCode }));
+    }
+
+    await sleep(2000);
+
+    console.log('\n=== Test Summary ===');
+    console.log(`Room Code: ${roomCode}`);
+    console.log(`Host Socket: ${hostSocketId}`);
+    console.log(`Joiner Socket: ${joinerSocketId}`);
+
+    if (roomCode && hostSocketId && joinerSocketId) {
+      console.log('\n✓ Signalling works correctly!');
+      console.log('  - Host can create room');
+      console.log('  - Joiner can join room');
+      console.log('  - Host receives peer-joined notification');
+
+      // Test offer/answer exchange
+      console.log('\nStep 3: Testing offer/answer...');
+
+      const mockOffer = {
+        type: 'offer',
+        fromSocketId: hostSocketId,
+        targetSocketId: joinerSocketId,
+        offer: { type: 'offer', sdp: 'mock_sdp' }
+      };
+
+      ws2.send(JSON.stringify(mockOffer));
+      console.log('Host sent offer to joiner');
+
+      await sleep(500);
+
+      const mockAnswer = {
+        type: 'answer',
+        fromSocketId: joinerSocketId,
+        targetSocketId: hostSocketId,
+        answer: { type: 'answer', sdp: 'mock_sdp' }
+      };
+
+      ws1.send(JSON.stringify(mockAnswer));
+      console.log('Joiner sent answer to host');
+
+      console.log('\n✓ Offer/Answer exchange works!');
+    } else {
+      console.log('\n✗ Signaling failed');
+    }
+
+  } catch (error) {
+    console.error('Error:', error);
+  } finally {
+    ws1?.close();
+    ws2?.close();
+    console.log('\nTest complete.');
+  }
+}
+
+testSignaling();

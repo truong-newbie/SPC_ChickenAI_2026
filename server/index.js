@@ -1,166 +1,218 @@
-import express from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import dotenv from 'dotenv';
+/**
+ * FileBridge Signaling Server
+ * Based on Floe's signaling architecture
+ *
+ * Features:
+ * - Socket.IO for browser clients
+ * - Room management with sender/receiver roles
+ * - WebRTC signal relay
+ * - Rate limiting
+ */
 
-dotenv.config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
-const httpServer = createServer(app);
-
+const httpServer = http.createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CLIENT_URL || '*',
+    origin: '*',
     methods: ['GET', 'POST'],
   },
+  maxHttpBufferSize: 1e6,
 });
 
 app.use(cors());
 app.use(express.json());
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    rooms: rooms.size,
+    connections: io.engine.clientsCount,
+  });
 });
 
-// Room management
+// In-memory room storage: roomId -> [sender, receiver]
 const rooms = new Map();
 
+// Room ID: 6-char alphanumeric
+function generateRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+// Rate limiting
+const connectionCounts = new Map();
+const RATE_LIMIT_WINDOW = 60000;
+const MAX_CONNECTIONS_PER_IP = 30;
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const timestamps = (connectionCounts.get(ip) || []).filter(t => now - t < RATE_LIMIT_WINDOW);
+  if (timestamps.length >= MAX_CONNECTIONS_PER_IP) {
+    return false;
+  }
+  timestamps.push(now);
+  connectionCounts.set(ip, timestamps);
+  return true;
+}
+
+// Cleanup old rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, timestamps] of connectionCounts.entries()) {
+    const valid = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW);
+    if (valid.length === 0) {
+      connectionCounts.delete(ip);
+    } else {
+      connectionCounts.set(ip, valid);
+    }
+  }
+  // Cleanup empty rooms
+  for (const [roomId, peers] of rooms.entries()) {
+    if (peers.length === 0 || peers.every(p => !p.connected)) {
+      rooms.delete(roomId);
+    }
+  }
+}, 60000).unref();
+
+// ============================================================================
 // Socket.IO signaling
+// ============================================================================
+
 io.on('connection', (socket) => {
-  console.log(`Client connected: ${socket.id}`);
+  const ip = socket.handshake.address || socket.handshake.headers['x-forwarded-for'] || 'unknown';
 
-  // Create a room
-  socket.on('create-room', (data, callback) => {
-    const { roomCode } = data;
+  if (!checkRateLimit(ip)) {
+    socket.emit('error', { message: 'Too many connections from this IP' });
+    socket.disconnect();
+    return;
+  }
 
-    if (rooms.has(roomCode)) {
-      callback({ success: false, error: 'Room already exists' });
+  console.log(`[SERVER] Client connected: ${socket.id}`);
+
+  // Handle join room
+  socket.on('join-room', (data) => {
+    let roomCode;
+
+    // data can be roomCode string OR { roomCode } object
+    if (typeof data === 'string') {
+      roomCode = data;
+    } else if (typeof data === 'object' && data.roomCode) {
+      roomCode = data.roomCode;
+    } else {
+      socket.emit('error', { message: 'Invalid join-room request' });
       return;
     }
 
-    rooms.set(roomCode, {
-      host: socket.id,
-      clients: [socket.id],
-      createdAt: Date.now(),
-    });
+    console.log(`[SERVER] ← ${socket.id} join-room: ${roomCode}`);
 
-    socket.join(roomCode);
-    socket.data.roomCode = roomCode;
-
-    console.log(`Room created: ${roomCode} by ${socket.id}`);
-    callback({ success: true, roomCode });
-  });
-
-  // Join a room
-  socket.on('join-room', (data, callback) => {
-    const { roomCode } = data;
-    const room = rooms.get(roomCode);
+    // Get or create room
+    let room = rooms.get(roomCode);
 
     if (!room) {
-      callback({ success: false, error: 'Room not found' });
+      // First peer - becomes sender
+      room = [];
+      rooms.set(roomCode, room);
+    }
+
+    if (room.length >= 2) {
+      socket.emit('room-full', {});
+      console.log(`[SERVER] → ${socket.id} room-full`);
       return;
     }
 
-    // Check if room is full (max 2 clients: host + 1 peer)
-    if (room.clients.length >= 2) {
-      callback({ success: false, error: 'Room is full' });
+    // Add peer to room
+    room.push(socket);
+    socket.roomCode = roomCode;
+    socket.isSender = room.length === 1;
+
+    // Send role to joining peer
+    socket.emit('room-joined', {
+      roomCode,
+      role: socket.isSender ? 'sender' : 'receiver',
+    });
+    console.log(`[SERVER] → ${socket.id} room-joined (role: ${socket.isSender ? 'sender' : 'receiver'})`);
+
+    // Notify sender that receiver joined
+    if (!socket.isSender && room[0]) {
+      room[0].emit('user-connected', { id: socket.id });
+      console.log(`[SERVER] → ${room[0].id} user-connected`);
+    }
+  });
+
+  // Handle signal relay (WebRTC SDP/ICE)
+  socket.on('signal', (data) => {
+    if (!socket.roomCode) {
+      console.log(`[SERVER] ${socket.id} tried to signal without a room`);
       return;
     }
 
-    room.clients.push(socket.id);
-    socket.join(roomCode);
-    socket.data.roomCode = roomCode;
+    const room = rooms.get(socket.roomCode);
+    if (!room) return;
 
-    // Notify host about new peer
-    io.to(room.host).emit('peer-joined', { peerId: socket.id });
+    // Find the other peer
+    const target = room.find(p => p.id !== socket.id);
+    if (!target) return;
 
-    console.log(`Client ${socket.id} joined room: ${roomCode}`);
-    callback({ success: true, roomCode, isHost: false });
-  });
-
-  // WebRTC signaling: send offer
-  socket.on('offer', (data) => {
-    const { targetId, offer } = data;
-    io.to(targetId).emit('offer', {
-      offer,
-      fromId: socket.id,
+    console.log(`[SERVER] ${socket.id} → signal → ${target.id}`);
+    target.emit('signal', {
+      signal: data.signal || data,
+      sender: socket.id,
     });
   });
 
-  // WebRTC signaling: send answer
-  socket.on('answer', (data) => {
-    const { targetId, answer } = data;
-    io.to(targetId).emit('answer', {
-      answer,
-      fromId: socket.id,
-    });
-  });
+  // Handle disconnect
+  socket.on('disconnect', (reason) => {
+    console.log(`[SERVER] Client disconnected: ${socket.id} (${reason})`);
 
-  // WebRTC signaling: ICE candidate
-  socket.on('ice-candidate', (data) => {
-    const { targetId, candidate } = data;
-    io.to(targetId).emit('ice-candidate', {
-      candidate,
-      fromId: socket.id,
-    });
-  });
+    if (socket.roomCode) {
+      const room = rooms.get(socket.roomCode);
+      if (room) {
+        // Remove from room
+        const index = room.indexOf(socket);
+        if (index > -1) {
+          room.splice(index, 1);
+        }
 
-  // Get room info
-  socket.on('get-room-info', (data, callback) => {
-    const { roomCode } = data;
-    const room = rooms.get(roomCode);
+        // Notify remaining peer
+        if (room.length === 1 && room[0]) {
+          room[0].emit('peer-disconnected', {});
+          console.log(`[SERVER] → ${room[0].id} peer-disconnected`);
+        }
 
-    if (!room) {
-      callback({ success: false, error: 'Room not found' });
-      return;
-    }
-
-    callback({
-      success: true,
-      roomInfo: {
-        roomCode,
-        clientCount: room.clients.length,
-        isFull: room.clients.length >= 2,
-      },
-    });
-  });
-
-  // Disconnect handling
-  socket.on('disconnect', () => {
-    const roomCode = socket.data.roomCode;
-
-    if (roomCode && rooms.has(roomCode)) {
-      const room = rooms.get(roomCode);
-      room.clients = room.clients.filter((id) => id !== socket.id);
-
-      // Notify remaining peers
-      io.to(roomCode).emit('peer-disconnected', { peerId: socket.id });
-
-      // Clean up empty rooms after a delay
-      if (room.clients.length === 0) {
-        setTimeout(() => {
-          const currentRoom = rooms.get(roomCode);
-          if (currentRoom && currentRoom.clients.length === 0) {
-            rooms.delete(roomCode);
-            console.log(`Room deleted: ${roomCode}`);
-          }
-        }, 60000); // Keep room for 1 minute for reconnection
+        // Delete empty room
+        if (room.length === 0) {
+          rooms.delete(socket.roomCode);
+        }
       }
     }
-
-    console.log(`Client disconnected: ${socket.id}`);
   });
 });
 
-const PORT = process.env.PORT || 3001;
+// ============================================================================
+// Start server
+// ============================================================================
+
+const PORT = process.env.PORT || 3002;
 
 httpServer.listen(PORT, () => {
   console.log(`
-╔════════════════════════════════════════════════════╗
-║     FileBridge Signaling Server                    ║
-║     Running on http://localhost:${PORT}               ║
-╚════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════╗
+║          FileBridge Signaling Server (Floe-style)     ║
+║  Status: Running                                      ║
+║  Port: ${PORT}                                            ║
+║  WebSocket: Socket.IO                                 ║
+║  Protocol: WebRTC signaling relay                     ║
+╚════════════════════════════════════════════════════════╝
   `);
 });

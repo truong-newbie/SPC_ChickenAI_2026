@@ -24,6 +24,8 @@ interface AppState {
   // UI State
   isHost: boolean;
   setIsHost: (isHost: boolean) => void;
+  view: string;
+  setView: (view: string) => void;
 
   // Actions
   reset: () => void;
@@ -71,6 +73,8 @@ export const useAppStore = create<AppState>((set) => ({
   // UI State
   isHost: false,
   setIsHost: (isHost) => set({ isHost }),
+  view: 'home',
+  setView: (view) => set({ view }),
 
   // Reset
   reset: () =>
@@ -80,5 +84,6 @@ export const useAppStore = create<AppState>((set) => ({
       peerId: null,
       files: [],
       isHost: false,
+      view: 'home',
     }),
 }));
