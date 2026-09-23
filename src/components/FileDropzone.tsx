@@ -63,9 +63,36 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
     [onFilesSelected]
   );
 
+  const handleFolderInput = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const items = e.target.files || [];
+      const allFiles: File[] = [];
+
+      // Get all files from directory structure
+      for (let i = 0; i < items.length; i++) {
+        const file = items[i];
+        // file.webkitRelativePath contains the directory structure
+        allFiles.push(file);
+      }
+
+      if (allFiles.length > 0) {
+        console.log(`[Dropzone] Selected ${allFiles.length} files from folder`);
+        onFilesSelected(allFiles);
+      }
+      e.target.value = '';
+    },
+    [onFilesSelected]
+  );
+
   const handleClick = useCallback(() => {
     if (!disabled) {
-      fileInputRef.current?.click();
+      // Show option to select files or folder
+      const choice = window.confirm('Chọn "OK" để chọn thư mục, "Cancel" để chọn file đơn lẻ');
+      if (choice) {
+        document.getElementById('folder-input')?.click();
+      } else {
+        fileInputRef.current?.click();
+      }
     }
   }, [disabled]);
 
@@ -131,6 +158,26 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
           <FormatBadge icon="🎬" text="Video" />
           <FormatBadge icon="💾" text="Mọi file" />
         </div>
+
+        {/* Hidden folder input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          id="file-input"
+          className="hidden"
+          multiple
+          onChange={handleFileInput}
+          disabled={disabled}
+        />
+        <input
+          type="file"
+          id="folder-input"
+          className="hidden"
+          // @ts-ignore - webkitdirectory is not in TS types
+          webkitdirectory=""
+          onChange={handleFolderInput}
+          disabled={disabled}
+        />
 
         <p className="text-xs text-gray-400 dark:text-gray-500 mt-2">
           Không giới hạn kích thước • Mã hóa E2E

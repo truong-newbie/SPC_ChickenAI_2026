@@ -1,61 +1,71 @@
-import { useCallback } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import { useAppStore } from './store/useAppStore';
 import { useP2P } from './hooks/useP2P';
 import { FileDropzone } from './components/FileDropzone';
 import { FileList } from './components/FileList';
-import { JoinRoom } from './components/JoinRoom';
-import { RoomCode } from './components/RoomCode';
+import { ShareLinkPanel } from './components/ShareLinkPanel';
 import { ConnectionStatus } from './components/ConnectionStatus';
+import { ReceivedFilesPanel } from './components/ReceivedFilesPanel';
 import type { FileTransfer } from './types';
-
-type ViewType = 'home' | 'room' | 'connected';
 
 function App() {
   const {
     connection,
-    roomCode,
     files,
     removeFile,
     setView: setStoreView,
     view: storeView,
     reset,
+    setShareLink,
+    shareLink,
   } = useAppStore();
 
-  // Dùng P2P hook
   const {
     createRoom,
-    joinRoom,
     sendFiles,
     disconnect,
+    isConnected,
   } = useP2P();
 
-  const view = (storeView as ViewType) || 'home';
+  const view = (storeView as string) || 'home';
 
-  // Tạo phòng
+  // Create room and get share link
   const handleCreateRoom = useCallback(async () => {
-    const code = await createRoom();
-    if (code) {
-      setStoreView('room');
+    const link = await createRoom();
+    if (link) {
+      setShareLink(link);
+      setStoreView('sender');
     }
-  }, [createRoom, setStoreView]);
+  }, [createRoom, setShareLink, setStoreView]);
 
-  // Tham gia phòng
-  const handleJoinRoom = useCallback(async (code: string) => {
-    await joinRoom(code);
-    setStoreView('room');
-  }, [joinRoom, setStoreView]);
-
-  // Xử lý file được chọn
+  // Handle file selection
   const handleFilesSelected = useCallback(async (items: (File | DataTransferItem)[]) => {
     await sendFiles(items);
   }, [sendFiles]);
 
-  // Rời phòng
+  // Leave room
   const handleLeave = useCallback(() => {
     disconnect();
     reset();
     setStoreView('home');
   }, [disconnect, reset, setStoreView]);
+
+  // Copy link
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(shareLink || '');
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }, [shareLink]);
+
+  // Auto-detect role from URL on mount
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (hash.includes('room=')) {
+      // Has room in URL = receiver mode
+      setStoreView('receiver');
+    }
+  }, [setStoreView]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-purple-50 dark:from-gray-900 dark:via-gray-800 dark:to-gray-900">
@@ -70,7 +80,7 @@ function App() {
             </div>
             <div>
               <h1 className="text-2xl font-bold text-gray-900 dark:text-white">FileBridge</h1>
-              <p className="text-sm text-gray-500 dark:text-gray-400">Chuyển file P2P bảo mật</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">Chia sẻ file P2P bảo mật</p>
             </div>
           </div>
 
@@ -82,28 +92,26 @@ function App() {
           {view === 'home' && (
             <HomeView
               onCreateRoom={handleCreateRoom}
-              onJoinRoom={handleJoinRoom}
               error={connection.error || undefined}
             />
           )}
 
-          {view === 'room' && (
-            <RoomView
-              roomCode={roomCode || ''}
-              isConnected={connection.status === 'connected'}
+          {view === 'sender' && (
+            <SenderView
+              shareLink={shareLink || ''}
+              isConnected={isConnected}
               files={files}
+              onCopy={handleCopy}
+              copied={copied}
               onSendFiles={handleFilesSelected}
               onRemoveFile={removeFile}
               onLeave={handleLeave}
             />
           )}
 
-          {view === 'connected' && (
-            <ConnectedView
-              files={files}
-              onSendFiles={handleFilesSelected}
-              onRemoveFile={removeFile}
-              onDisconnect={disconnect}
+          {view === 'receiver' && (
+            <ReceiverView
+              isConnected={isConnected}
               onLeave={handleLeave}
             />
           )}
@@ -120,11 +128,10 @@ function App() {
 
 interface HomeViewProps {
   onCreateRoom: () => void;
-  onJoinRoom: (code: string) => void;
   error?: string;
 }
 
-function HomeView({ onCreateRoom, onJoinRoom, error }: HomeViewProps) {
+function HomeView({ onCreateRoom, error }: HomeViewProps) {
   return (
     <div className="space-y-8">
       <div className="text-center">
@@ -143,28 +150,16 @@ function HomeView({ onCreateRoom, onJoinRoom, error }: HomeViewProps) {
         </div>
       )}
 
-      <div className="grid md:grid-cols-2 gap-6 max-w-2xl mx-auto">
-        <div className="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 text-center">
-          <div className="w-12 h-12 bg-primary-100 dark:bg-primary-900/30 rounded-xl flex items-center justify-center text-primary-600 dark:text-primary-400 mb-4 mx-auto">
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-            </svg>
-          </div>
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Tạo phòng mới</h3>
-          <p className="text-gray-600 dark:text-gray-400 text-sm mb-4">
-            Tạo phòng và chia sẻ mã với người muốn nhận file
-          </p>
-          <button
-            onClick={onCreateRoom}
-            className="w-full py-3 px-6 bg-primary-500 hover:bg-primary-600 text-white font-medium rounded-xl transition-colors"
-          >
-            Tạo phòng
-          </button>
-        </div>
-
-        <div className="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
-          <JoinRoom onJoin={onJoinRoom} />
-        </div>
+      <div className="text-center">
+        <button
+          onClick={onCreateRoom}
+          className="px-8 py-4 bg-primary-500 hover:bg-primary-600 text-white font-medium rounded-xl transition-colors text-lg shadow-lg hover:shadow-xl"
+        >
+          Tạo link chia sẻ
+        </button>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-3">
+          Chọn file và tạo link để chia sẻ với người nhận
+        </p>
       </div>
 
       <Features />
@@ -218,37 +213,51 @@ function FeatureCard({ icon, title, description }: { icon: React.ReactNode; titl
   );
 }
 
-interface RoomViewProps {
-  roomCode: string;
+interface SenderViewProps {
+  shareLink: string;
   isConnected: boolean;
   files: FileTransfer[];
+  copied: boolean;
+  onCopy: () => void;
   onSendFiles: (items: (File | DataTransferItem)[]) => void;
   onRemoveFile: (id: string) => void;
   onLeave: () => void;
 }
 
-function RoomView({ roomCode, isConnected, files, onSendFiles, onRemoveFile, onLeave }: RoomViewProps) {
+function SenderView({
+  shareLink,
+  isConnected,
+  files,
+  copied,
+  onCopy,
+  onSendFiles,
+  onRemoveFile,
+  onLeave,
+}: SenderViewProps) {
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div className="text-center">
         <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">
-          {isConnected ? 'Đã kết nối!' : 'Đang chờ người tham gia...'}
+          {isConnected ? '✅ Đã kết nối!' : '⏳ Đang chờ người nhận...'}
         </h2>
         <p className="text-gray-600 dark:text-gray-400">
-          {isConnected ? 'Bạn có thể gửi file ngay bây giờ' : 'Chia sẻ mã phòng với người muốn nhận file'}
+          {isConnected
+            ? 'Chọn file để gửi'
+            : 'Chia sẻ link bên dưới với người nhận'}
         </p>
       </div>
 
-      <RoomCode code={roomCode} isHost={true} />
+      {/* Share Link Panel */}
+      <ShareLinkPanel link={shareLink} onCopy={onCopy} copied={copied} />
 
-      {isConnected && (
-        <>
-          <FileDropzone onFilesSelected={onSendFiles} disabled={false} />
-          <FileList files={files} onRemove={onRemoveFile} />
-        </>
-      )}
+      {/* File Selection */}
+      <FileDropzone onFilesSelected={onSendFiles} disabled={false} />
 
-      <div className="text-center">
+      {/* File List */}
+      <FileList files={files} onRemove={onRemoveFile} />
+
+      {/* Leave Button */}
+      <div className="text-center pt-4">
         <button
           onClick={onLeave}
           className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
@@ -260,39 +269,33 @@ function RoomView({ roomCode, isConnected, files, onSendFiles, onRemoveFile, onL
   );
 }
 
-interface ConnectedViewProps {
-  files: FileTransfer[];
-  onSendFiles: (items: (File | DataTransferItem)[]) => void;
-  onRemoveFile: (id: string) => void;
-  onDisconnect: () => void;
+interface ReceiverViewProps {
+  isConnected: boolean;
   onLeave: () => void;
 }
 
-function ConnectedView({ files, onSendFiles, onRemoveFile, onDisconnect, onLeave }: ConnectedViewProps) {
+function ReceiverView({ isConnected, onLeave }: ReceiverViewProps) {
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div className="text-center">
-        <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-100 dark:bg-green-900/30 rounded-full text-green-700 dark:text-green-400 mb-4">
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-          </svg>
-          <span className="font-medium">Đã kết nối P2P thành công!</span>
-        </div>
+        <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">
+          {isConnected ? '🔗 Đã kết nối' : '⏳ Đang kết nối...'}
+        </h2>
+        <p className="text-gray-600 dark:text-gray-400">
+          {isConnected
+            ? 'Đang nhận file từ người gửi'
+            : 'Vui lòng chờ người gửi kết nối'}
+        </p>
       </div>
 
-      <FileDropzone onFilesSelected={onSendFiles} disabled={false} />
-      <FileList files={files} onRemove={onRemoveFile} />
+      {/* Received Files Panel */}
+      <ReceivedFilesPanel />
 
-      <div className="flex justify-center gap-4">
-        <button
-          onClick={onDisconnect}
-          className="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
-        >
-          Ngắt kết nối
-        </button>
+      {/* Leave Button */}
+      <div className="text-center pt-4">
         <button
           onClick={onLeave}
-          className="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
+          className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
         >
           Rời phòng
         </button>

@@ -40,14 +40,13 @@ app.get('/health', (req, res) => {
 // In-memory room storage: roomId -> [sender, receiver]
 const rooms = new Map();
 
-// Room ID: 6-char alphanumeric
-function generateRoomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return code;
+// Generate UUID v4
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
 }
 
 // Rate limiting
@@ -104,8 +103,14 @@ io.on('connection', (socket) => {
   socket.on('join-room', (data) => {
     let roomCode;
 
-    // data can be roomCode string OR { roomCode } object
-    if (typeof data === 'string') {
+    // data can be:
+    // - null/undefined: sender creating new room
+    // - string: room code to join
+    // - { roomCode }: room code object
+    if (!data) {
+      // Sender creating new room - generate code
+      roomCode = generateRoomCode();
+    } else if (typeof data === 'string') {
       roomCode = data;
     } else if (typeof data === 'object' && data.roomCode) {
       roomCode = data.roomCode;

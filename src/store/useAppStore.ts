@@ -14,6 +14,10 @@ interface AppState {
   peerId: string | null;
   setPeerId: (id: string | null) => void;
 
+  // Share Link
+  shareLink: string | null;
+  setShareLink: (link: string) => void;
+
   // Files
   files: FileTransfer[];
   addFile: (file: FileTransfer) => void;
@@ -54,6 +58,10 @@ export const useAppStore = create<AppState>((set) => ({
   peerId: null,
   setPeerId: (id) => set({ peerId: id }),
 
+  // Share Link
+  shareLink: null,
+  setShareLink: (link) => set({ shareLink: link }),
+
   // Files
   files: [],
   addFile: (file) =>
@@ -82,6 +90,7 @@ export const useAppStore = create<AppState>((set) => ({
       connection: initialConnection,
       roomCode: null,
       peerId: null,
+      shareLink: null,
       files: [],
       isHost: false,
       view: 'home',

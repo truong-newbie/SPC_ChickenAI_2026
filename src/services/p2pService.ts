@@ -7,6 +7,7 @@ import { io, Socket } from 'socket.io-client';
 import { createReceiver, type ReceivedFile } from '../lib/transfer/receiver';
 import { sendFiles, type FileEntry } from '../lib/transfer/sender';
 import { generateFileId } from '../lib/transfer/protocol';
+import { generateRoomId, buildShareLink } from '../lib/roomLink';
 
 // Types
 export interface TransferCallbacks {
@@ -16,9 +17,10 @@ export interface TransferCallbacks {
   onPeerId?: (peerId: string) => void;
   onError?: (error: string) => void;
   onFilesReceived?: (files: ReceivedFile[]) => void;
-  onFileStart?: (index: number, total: number, fileName: string) => void;
+  onFileStart?: (index: number, total: number, fileName: string, fileSize?: number) => void;
   onProgress?: (percent: number, received?: number, total?: number) => void;
   onSpeed?: (bytesPerSec: number, etaSeconds: number) => void;
+  onFileComplete?: (file: { fileName: string; fileSize: number }, index: number, total: number) => void;
   onTransferComplete?: () => void;
 }
 
@@ -35,6 +37,8 @@ class RoomBasedService {
   private isHost = false;
   private receivedFiles: ReceivedFile[] = [];
   private isInitiatingConnection = false;
+  private pendingFiles: File[] = [];
+  private isSending = false;
 
   initialize(callbacks: TransferCallbacks) {
     this.callbacks = callbacks;
@@ -42,56 +46,76 @@ class RoomBasedService {
 
   /**
    * Create a room - becomes the sender
+   * Returns shareable link with room ID in URL fragment
    */
   async createRoom(): Promise<string> {
     this.connectSignaling();
     this.isHost = true;
     this.callbacks.onStatusChange?.('connecting');
 
+    // Generate UUID room ID
+    const roomId = generateRoomId();
+    console.log('[P2P] Creating room:', roomId);
+
     // Wait for socket
     await this.waitForSocket();
 
     return new Promise((resolve, reject) => {
-      const handleRoomJoined = (data: { roomCode: string; role: string }) => {
+      const handleRoomJoined = (_data: { roomCode: string; role: string }) => {
         this.socket?.off('room-joined', handleRoomJoined);
-        resolve(data.roomCode);
+        console.log('[P2P] Room created, initiating WebRTC...');
+        // Sender initiates WebRTC connection
+        this.initiateConnection();
+        // Return full share link with UUID in fragment
+        const link = buildShareLink(window.location.origin, roomId);
+        resolve(link);
       };
 
       this.socket?.on('room-joined', handleRoomJoined);
       this.socket?.on('error', (err: Error) => reject(err));
 
-      this.socket?.emit('join-room', null);
+      // Join with specific room ID
+      this.socket?.emit('join-room', roomId);
     });
   }
 
   /**
    * Join a room - becomes the receiver
+   * Gets room ID from URL fragment
    */
-  async joinRoom(roomCode: string): Promise<void> {
+  async joinRoom(): Promise<void> {
     this.connectSignaling();
     this.isHost = false;
     this.callbacks.onStatusChange?.('connecting');
+
+    // Get room ID from URL fragment
+    const roomId = this.getRoomFromUrl();
+    if (!roomId) {
+      throw new Error('No room ID in URL');
+    }
+    console.log('[P2P] Joining room:', roomId);
 
     await this.waitForSocket();
 
     return new Promise((resolve, reject) => {
       const handleRoomJoined = (_data: { roomCode: string; role: string }) => {
         this.socket?.off('room-joined', handleRoomJoined);
+        console.log('[P2P] Joined as receiver');
         resolve();
       };
 
-      const handleUserConnected = (data: { id: string }) => {
-        this.peerSocketId = data.id;
-        console.log('[P2P] Peer connected:', this.peerSocketId);
-        this.startConnection(true);
-      };
-
       this.socket?.on('room-joined', handleRoomJoined);
-      this.socket?.on('user-connected', handleUserConnected);
       this.socket?.on('error', (err: Error) => reject(err));
 
-      this.socket?.emit('join-room', roomCode);
+      this.socket?.emit('join-room', roomId);
     });
+  }
+
+  private getRoomFromUrl(): string | null {
+    if (typeof window === 'undefined') return null;
+    const hash = window.location.hash;
+    const match = hash.match(/[#&]?room=([^&]+)/);
+    return match ? match[1] : null;
   }
 
   private connectSignaling() {
@@ -190,6 +214,11 @@ class RoomBasedService {
     }
   }
 
+  // Called by sender when creating room to initiate WebRTC
+  initiateConnection() {
+    this.startConnection(true);
+  }
+
   private setupPeerConnection() {
     this.pc = new RTCPeerConnection({
       iceServers: [
@@ -251,9 +280,10 @@ class RoomBasedService {
       onSpeed: (bytesPerSec, eta) => {
         this.callbacks.onSpeed?.(bytesPerSec, eta);
       },
-      onFileComplete: (file, _index, _total) => {
+      onFileComplete: (file, index, total) => {
         console.log(`[P2P] File complete: ${file.fileName}`);
         this.receivedFiles.push(file);
+        this.callbacks.onFileComplete?.(file, index, total);
       },
       onAllComplete: (totalBytes, fileCount) => {
         console.log(`[P2P] Transfer complete: ${fileCount} files, ${totalBytes} bytes`);
@@ -271,8 +301,11 @@ class RoomBasedService {
     });
 
     channel.onopen = () => {
-      console.log('[P2P] Data channel open');
+      console.log('[P2P] Data channel OPEN');
       this.callbacks.onStatusChange?.('connected');
+      this.isConnected = true;
+      this.callbacks.onConnection?.();
+      this.maybeAutoSend();
     };
 
     channel.onclose = () => {
@@ -291,6 +324,17 @@ class RoomBasedService {
     }
   }
 
+  private async maybeAutoSend() {
+    if (this.pendingFiles.length === 0 || this.isSending) return;
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+    this.isSending = true;
+    try {
+      await this.sendFiles(this.pendingFiles);
+    } finally {
+      this.isSending = false;
+    }
+  }
+
   private sendSignal(signal: RTCSessionDescriptionInit | RTCIceCandidateInit) {
     if (!this.socket?.connected || !this.peerSocketId) return;
     this.socket.emit('signal', {
@@ -300,7 +344,9 @@ class RoomBasedService {
   }
 
   private async handleOffer(offer: RTCSessionDescriptionInit) {
-    this.setupPeerConnection();
+    if (!this.pc) {
+      this.setupPeerConnection();
+    }
     await this.pc!.setRemoteDescription(offer);
     const answer = await this.pc!.createAnswer();
     await this.pc!.setLocalDescription(answer);
@@ -320,11 +366,15 @@ class RoomBasedService {
   }
 
   /**
-   * Send files over the data channel
+   * Queue files to send over the data channel.
+   * If channel is not yet open, will auto-send when it opens.
    */
   async sendFiles(files: File[]): Promise<void> {
     if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      throw new Error('Data channel not open');
+      // Queue files for auto-send when channel opens
+      this.pendingFiles = [...this.pendingFiles, ...files];
+      console.log(`[P2P] Queued ${files.length} files for auto-send`);
+      return;
     }
 
     const entries: FileEntry[] = files.map(file => ({
