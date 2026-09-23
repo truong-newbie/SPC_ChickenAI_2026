@@ -1,7 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react';
 import p2pService from '../services/p2pService';
 import { useAppStore } from '../store/useAppStore';
-import { generateRoomCode } from '../utils/room';
 
 export function useP2P() {
   const {
@@ -18,57 +17,76 @@ export function useP2P() {
   } = useAppStore();
 
   const isHostRef = useRef(false);
-  const targetRoomCode = useRef<string | null>(null);
+  const initializedRef = useRef(false);
+
+  // Use refs to ensure callbacks always read latest state from store
+  const setConnectionRef = useRef(setConnection);
+  const setPeerIdRef = useRef(setPeerId);
+  const updateFileRef = useRef(updateFile);
+  const addFileRef = useRef(addFile);
+
+  useEffect(() => {
+    setConnectionRef.current = setConnection;
+    setPeerIdRef.current = setPeerId;
+    updateFileRef.current = updateFile;
+    addFileRef.current = addFile;
+  });
 
   const initializeP2P = useCallback(() => {
+    if (initializedRef.current) return;
+    initializedRef.current = true;
+
     p2pService.initialize({
       onPeerId: (id) => {
-        setPeerId(id);
-        setConnection({ status: 'connecting' });
+        setPeerIdRef.current(id);
+        setConnectionRef.current({ status: 'connecting' });
       },
       onConnection: () => {
-        setConnection({ status: 'connected' });
+        console.log('P2P: onConnection callback fired');
+        setConnectionRef.current({ status: 'connected' });
       },
       onDisconnect: () => {
-        setConnection({ status: 'disconnected' });
+        console.log('P2P: onDisconnect callback fired');
+        setConnectionRef.current({ status: 'disconnected' });
       },
       onFileProgress: (fileId, progress, speed) => {
-        updateFile(fileId, { progress, speed, status: 'transferring' });
+        updateFileRef.current(fileId, { progress, speed, status: 'transferring' });
       },
       onFileComplete: (fileId, file) => {
-        updateFile(fileId, { status: 'completed', progress: 100 });
+        updateFileRef.current(fileId, { status: 'completed', progress: 100 });
         downloadFile(file);
       },
       onError: (error) => {
-        setConnection({ status: 'error', error });
+        setConnectionRef.current({ status: 'error', error });
       },
     });
-  }, [setConnection, setPeerId, updateFile]);
+  }, []);
 
-  const createRoom = useCallback(() => {
-    const code = generateRoomCode();
-    setRoomCode(code);
-    setIsHost(true);
-    isHostRef.current = true;
-    targetRoomCode.current = code;
-    return code;
-  }, [setRoomCode, setIsHost]);
+  const createRoom = useCallback(async () => {
+    setConnection({ status: 'connecting' });
+    try {
+      const code = await p2pService.createRoom();
+      setRoomCode(code);
+      setIsHost(true);
+      isHostRef.current = true;
+      return code;
+    } catch (error: any) {
+      setConnection({ status: 'error', error: error.message });
+      return null;
+    }
+  }, [setRoomCode, setIsHost, setConnection]);
 
   const joinRoom = useCallback(
     async (code: string) => {
       setRoomCode(code);
       setIsHost(false);
       isHostRef.current = false;
-      targetRoomCode.current = code;
-
-      // The host's peer ID is the room code in our simple implementation
-      // In production, you'd use a signaling server to map codes to peer IDs
       setConnection({ status: 'connecting', roomCode: code });
 
       try {
-        await p2pService.connect(code);
-      } catch {
-        setConnection({ status: 'error', error: 'Không thể kết nối đến phòng' });
+        await p2pService.joinRoom(code);
+      } catch (error: any) {
+        setConnection({ status: 'error', error: error.message || 'Không thể kết nối đến phòng' });
       }
     },
     [setRoomCode, setIsHost, setConnection]
@@ -76,7 +94,7 @@ export function useP2P() {
 
   const sendFile = useCallback(
     async (file: File) => {
-      const fileId = await p2pService.sendFile(file);
+      const fileId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       addFile({
         id: fileId,
         name: file.name,
@@ -87,7 +105,53 @@ export function useP2P() {
         status: 'pending',
         encrypted: true,
       });
+
+      try {
+        await p2pService.sendFiles([file]);
+      } catch (error: any) {
+        updateFile(fileId, { status: 'error' });
+      }
       return fileId;
+    },
+    [addFile, updateFile]
+  );
+
+  const sendFiles = useCallback(
+    async (items: (File | DataTransferItem)[]) => {
+      // Thêm vào store
+      const fileIds: string[] = [];
+      const filesToProcess: File[] = [];
+
+      for (const item of items) {
+        let file: File | null = null;
+        if (item instanceof File) {
+          file = item;
+        } else if (item instanceof DataTransferItem && item.kind === 'file') {
+          file = item.getAsFile();
+        }
+        if (file) {
+          const id = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          addFile({
+            id,
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            progress: 0,
+            speed: 0,
+            status: 'pending',
+            encrypted: true,
+          });
+          fileIds.push(id);
+          filesToProcess.push(file);
+        }
+      }
+
+      try {
+        await p2pService.sendFiles(filesToProcess);
+      } catch (error: any) {
+        console.error('Send files error:', error);
+      }
+      return fileIds;
     },
     [addFile]
   );
@@ -95,11 +159,14 @@ export function useP2P() {
   const disconnect = useCallback(() => {
     p2pService.disconnect();
     setConnection({ status: 'disconnected' });
-  }, [setConnection]);
+    setIsHost(false);
+    isHostRef.current = false;
+  }, [setConnection, setIsHost]);
 
   const destroy = useCallback(() => {
     p2pService.destroy();
     reset();
+    initializedRef.current = false;
   }, [reset]);
 
   useEffect(() => {
@@ -107,20 +174,22 @@ export function useP2P() {
     return () => {
       p2pService.destroy();
     };
-  }, [initializeP2P]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     connection,
     roomCode,
-    peerId: p2pService.getPeerId(),
+    peerId: p2pService.getMySocketId(),
     files,
     isHost: isHostRef.current,
     createRoom,
     joinRoom,
     sendFile,
+    sendFiles,
     disconnect,
     destroy,
-    isConnected: p2pService.isConnected(),
+    isConnected: p2pService.isPeerConnected(),
   };
 }
 

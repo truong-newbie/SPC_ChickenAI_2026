@@ -1,4 +1,11 @@
-import Peer, { DataConnection } from 'peerjs';
+/**
+ * FileBridge - Signaling-based P2P Service
+ * Sử dụng local signaling server để kết nối 2 client qua mã phòng
+ * - KHÔNG phụ thuộc PeerJS Cloud
+ * - KHÔNG dùng Redis
+ * - WebRTC vẫn dùng RTCPeerConnection trực tiếp (không qua PeerJS)
+ */
+
 import {
   generateKeyPair,
   exportPublicKey,
@@ -8,119 +15,388 @@ import {
   decryptData,
   EncryptedData,
 } from '../utils/crypto';
-import type { PeerMessage, FileTransfer } from '../types';
+import type { PeerMessage } from '../types';
 import { generateFileId } from '../utils/room';
 
-const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+const CHUNK_SIZE = 64 * 1024;
+const SIGNALING_SERVER = 'http://localhost:3002';
 
-interface P2PServiceConfig {
+export interface TransferCallbacks {
   onPeerId?: (id: string) => void;
   onConnection?: () => void;
   onDisconnect?: () => void;
+  onStatusChange?: (status: string, method?: string) => void;
   onFileProgress?: (fileId: string, progress: number, speed: number) => void;
   onFileComplete?: (fileId: string, file: File) => void;
   onError?: (error: string) => void;
 }
 
-class P2PService {
-  private peer: Peer | null = null;
-  private connection: DataConnection | null = null;
-  private config: P2PServiceConfig = {};
+interface PeerInfo {
+  socketId: string;
+  peerId: string;
+}
+
+class RoomBasedService {
+  private socket: WebSocket | null = null;
+  private mySocketId: string | null = null;
+  private peerInfo: PeerInfo | null = null;
+  private pc: RTCPeerConnection | null = null;
+  private dataChannel: RTCDataChannel | null = null;
+  private remoteDataChannel: RTCDataChannel | null = null;
+  private callbacks: TransferCallbacks = {};
+  private isConnected = false;
+  private isHost = false;
   private myKeyPair: CryptoKeyPair | null = null;
   private sharedKey: CryptoKey | null = null;
-  private fileChunks: Map<string, { chunks: ArrayBuffer[]; meta: FileTransfer }> = new Map();
+  private fileChunks: Map<string, { chunks: ArrayBuffer[]; meta: any }> = new Map();
+  private isInitiatingConnection = false;
+  private pendingIceCandidates: RTCIceCandidateInit[] = [];
 
-  initialize(config: P2PServiceConfig) {
-    this.config = config;
-    this.createPeer();
+  initialize(callbacks: TransferCallbacks) {
+    this.callbacks = callbacks;
   }
 
-  private createPeer() {
-    this.peer = new Peer({
-      debug: 1,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-        ],
-      },
-    });
+  /**
+   * Tạo phòng - host
+   */
+  async createRoom(): Promise<string> {
+    this.connectSignaling();
+    this.isHost = true;
+    this.callbacks.onStatusChange?.('connecting');
 
-    this.peer.on('open', (id) => {
-      console.log('Peer connected with ID:', id);
-      this.config.onPeerId?.(id);
-    });
-
-    this.peer.on('connection', (conn) => {
-      this.handleConnection(conn);
-    });
-
-    this.peer.on('error', (err) => {
-      console.error('Peer error:', err);
-      this.config.onError?.(err.message);
-    });
-
-    this.peer.on('disconnected', () => {
-      console.log('Peer disconnected');
-      this.config.onDisconnect?.();
-    });
-  }
-
-  private async handleConnection(conn: DataConnection) {
-    this.connection = conn;
-
-    conn.on('open', async () => {
-      console.log('Connection opened');
-      this.config.onConnection?.();
-      await this.performKeyExchange();
-    });
-
-    conn.on('data', (data) => {
-      this.handleMessage(data as PeerMessage);
-    });
-
-    conn.on('close', () => {
-      console.log('Connection closed');
-      this.config.onDisconnect?.();
-    });
-
-    conn.on('error', (err) => {
-      console.error('Connection error:', err);
-      this.config.onError?.(err.message);
-    });
-  }
-
-  async connect(peerId: string): Promise<void> {
-    if (!this.peer) throw new Error('Peer not initialized');
+    // Wait for socket to open
+    await this.waitForSocket();
 
     return new Promise((resolve, reject) => {
-      const conn = this.peer!.connect(peerId, {
-        reliable: true,
-      });
+      const handler = (event: MessageEvent) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'room-created') {
+          this.mySocketId = data.socketId;
+          this.callbacks.onPeerId?.(data.roomCode);
+          resolve(data.roomCode);
+        } else if (data.type === 'peer-joined') {
+          // Only start connection if not already initiating
+          if (!this.isInitiatingConnection) {
+            this.peerInfo = { socketId: data.peerSocketId, peerId: data.peerPeerId };
+            this.startConnection(true);
+          }
+        } else if (data.type === 'error') {
+          reject(new Error(data.message));
+        }
+      };
 
-      conn.on('open', async () => {
-        this.connection = conn;
-        console.log('Connected to peer:', peerId);
-        this.config.onConnection?.();
-        await this.performKeyExchange();
-        resolve();
-      });
+      this.socket!.addEventListener('message', handler);
 
-      conn.on('data', (data) => {
-        this.handleMessage(data as PeerMessage);
-      });
-
-      conn.on('close', () => {
-        console.log('Connection closed');
-        this.config.onDisconnect?.();
-      });
-
-      conn.on('error', (err) => {
-        console.error('Connection error:', err);
-        this.config.onError?.(err.message);
-        reject(err);
-      });
+      this.sendSignaling({ type: 'create-room' });
     });
+  }
+
+  private waitForSocket(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        resolve();
+        return;
+      }
+      const handler = () => {
+        this.socket?.removeEventListener('open', handler);
+        resolve();
+      };
+      this.socket?.addEventListener('open', handler);
+    });
+  }
+
+  /**
+   * Tham gia phòng
+   */
+  async joinRoom(roomCode: string): Promise<void> {
+    this.connectSignaling();
+    this.isHost = false;
+    this.callbacks.onStatusChange?.('connecting');
+
+    return new Promise((resolve, reject) => {
+      const handler = (event: MessageEvent) => {
+        const data = JSON.parse(event.data);
+        if (data.type === 'room-joined') {
+          this.mySocketId = data.socketId;
+          this.peerInfo = { socketId: data.hostSocketId, peerId: data.hostPeerId };
+          // Người join chờ offer từ host
+          this.setupPeerConnection();
+          resolve();
+        } else if (data.type === 'error') {
+          reject(new Error(data.message));
+        }
+      };
+
+      this.socket!.addEventListener('message', handler, { once: false });
+
+      setTimeout(() => {
+        this.sendSignaling({ type: 'join-room', roomCode });
+      }, 100);
+    });
+  }
+
+  private connectSignaling() {
+    if (this.socket) return;
+
+    this.callbacks.onStatusChange?.('connecting');
+
+    this.socket = new WebSocket(SIGNALING_SERVER.replace('http', 'ws'));
+
+    this.socket.onopen = () => {
+      console.log('Signaling connected');
+    };
+
+    this.socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.handleSignalingMessage(data);
+    };
+
+    this.socket.onerror = () => {
+      this.callbacks.onError?.('Không thể kết nối signaling server. Hãy chạy: cd server && npm start');
+    };
+
+    this.socket.onclose = () => {
+      this.callbacks.onDisconnect?.();
+    };
+  }
+
+  private sendSignaling(message: any) {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify(message));
+    }
+  }
+
+  private handleSignalingMessage(data: any) {
+    switch (data.type) {
+      case 'room-created':
+        // Đã xử lý trong createRoom
+        break;
+
+      case 'room-joined':
+        // Đã xử lý trong joinRoom
+        break;
+
+      case 'peer-joined':
+        this.peerInfo = { socketId: data.peerSocketId, peerId: data.peerPeerId };
+        if (this.isHost) {
+          this.startConnection(true);
+        }
+        break;
+
+      case 'offer':
+        this.handleOffer(data.offer, data.fromSocketId);
+        break;
+
+      case 'answer':
+        this.handleAnswer(data.answer);
+        break;
+
+      case 'ice-candidate':
+        this.handleIceCandidate(data.candidate);
+        break;
+
+      case 'peer-disconnected':
+        this.callbacks.onDisconnect?.();
+        break;
+    }
+  }
+
+  /**
+   * Khởi tạo RTCPeerConnection
+   */
+  private setupPeerConnection() {
+    this.pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        // Open Relay Project - free TURN servers for NAT traversal
+        {
+          urls: 'turn:openrelay.metered.ca:80',
+          username: 'openrelayproject',
+          credential: 'openrelayproject',
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443',
+          username: 'openrelayproject',
+          credential: 'openrelayproject',
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+          username: 'openrelayproject',
+          credential: 'openrelayproject',
+        },
+      ],
+      iceCandidatePoolSize: 10,
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+    });
+
+    this.pc.onicecandidate = (event) => {
+      if (this.peerInfo) {
+        if (event.candidate) {
+          console.log('ICE candidate:', event.candidate.candidate);
+          this.sendSignaling({
+            type: 'ice-candidate',
+            targetSocketId: this.peerInfo.socketId,
+            candidate: event.candidate,
+          });
+        } else {
+          // null candidate = end of candidates
+          console.log('ICE gathering complete');
+          this.sendSignaling({
+            type: 'ice-candidate-complete',
+            targetSocketId: this.peerInfo.socketId,
+          });
+        }
+      }
+    };
+
+    this.pc.onicegatheringstatechange = () => {
+      console.log('ICE gathering state:', this.pc?.iceGatheringState);
+      if (this.pc?.iceGatheringState === 'complete' && this.peerInfo) {
+        this.sendSignaling({
+          type: 'ice-candidate-complete',
+          targetSocketId: this.peerInfo.socketId,
+        });
+      }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      console.log('ICE connection state:', this.pc?.iceConnectionState);
+      if (this.pc?.iceConnectionState === 'failed') {
+        console.error('ICE connection failed - check NAT/firewall');
+      }
+    };
+
+    this.pc.onconnectionstatechange = () => {
+      const state = this.pc?.connectionState;
+      console.log('Connection state:', state);
+      if (state === 'connected') {
+        this.isConnected = true;
+        this.callbacks.onConnection?.();
+        this.callbacks.onStatusChange?.('connected');
+      } else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+        this.isConnected = false;
+        this.callbacks.onDisconnect?.();
+      }
+    };
+
+    this.pc.ondatachannel = (event) => {
+      this.remoteDataChannel = event.channel;
+      this.setupDataChannelHandlers(this.remoteDataChannel);
+    };
+  }
+
+  /**
+   * Host khởi tạo kết nối - tạo offer
+   */
+  private async startConnection(isOfferer: boolean) {
+    if (this.isInitiatingConnection) {
+      console.log('Connection already initiating, skipping');
+      return;
+    }
+    this.isInitiatingConnection = true;
+
+    this.setupPeerConnection();
+
+    if (isOfferer) {
+      this.dataChannel = this.pc!.createDataChannel('filebridge', {
+        ordered: true,
+      });
+      this.setupDataChannelHandlers(this.dataChannel);
+
+      const offer = await this.pc!.createOffer();
+      await this.pc!.setLocalDescription(offer);
+
+      this.sendSignaling({
+        type: 'offer',
+        targetSocketId: this.peerInfo!.socketId,
+        offer: this.pc!.localDescription,
+      });
+    }
+  }
+
+  private async handleOffer(offer: RTCSessionDescriptionInit, fromSocketId: string) {
+    this.setupPeerConnection();
+
+    await this.pc!.setRemoteDescription(offer);
+
+    // Process any pending ICE candidates
+    await this.processPendingIceCandidates();
+
+    const answer = await this.pc!.createAnswer();
+    await this.pc!.setLocalDescription(answer);
+
+    this.sendSignaling({
+      type: 'answer',
+      targetSocketId: fromSocketId,
+      answer: this.pc!.localDescription,
+    });
+  }
+
+  private async handleAnswer(answer: RTCSessionDescriptionInit) {
+    await this.pc!.setRemoteDescription(answer);
+    // Process any pending ICE candidates after setting remote description
+    await this.processPendingIceCandidates();
+  }
+
+  private async processPendingIceCandidates() {
+    if (this.pendingIceCandidates.length > 0 && this.pc) {
+      console.log(`Processing ${this.pendingIceCandidates.length} pending ICE candidates`);
+      for (const candidate of this.pendingIceCandidates) {
+        try {
+          await this.pc.addIceCandidate(candidate);
+        } catch (e) {
+          console.error('Error adding pending ICE candidate', e);
+        }
+      }
+      this.pendingIceCandidates = [];
+    }
+  }
+
+  private async handleIceCandidate(candidate: RTCIceCandidateInit) {
+    // If remote description is not set yet, queue the candidate
+    if (!this.pc?.remoteDescription || !this.pc.remoteDescription.type) {
+      console.log('Remote description not set, queueing ICE candidate');
+      this.pendingIceCandidates.push(candidate);
+      return;
+    }
+
+    try {
+      await this.pc?.addIceCandidate(candidate);
+    } catch (e) {
+      console.error('Error adding ICE candidate', e);
+    }
+  }
+
+  private setupDataChannelHandlers(channel: RTCDataChannel) {
+    channel.binaryType = 'arraybuffer';
+
+    channel.onopen = () => {
+      console.log('DataChannel opened');
+      this.performKeyExchange();
+    };
+
+    channel.onclose = () => {
+      console.log('DataChannel closed');
+    };
+
+    channel.onerror = (err) => {
+      console.error('DataChannel error', err);
+    };
+
+    channel.onmessage = (event) => {
+      try {
+        const message: PeerMessage = JSON.parse(event.data);
+        this.handleDataMessage(message);
+      } catch (e) {
+        console.error('Error parsing message', e);
+      }
+    };
   }
 
   private async performKeyExchange() {
@@ -129,22 +405,12 @@ class P2PService {
       const publicKeyBuffer = await exportPublicKey(this.myKeyPair.publicKey);
       const publicKeyArray = new Uint8Array(publicKeyBuffer);
 
-      this.send({
+      this.sendViaDataChannel({
         type: 'text',
         text: `key_exchange:${Array.from(publicKeyArray).join(',')}`,
       });
-
-      // First peer to connect becomes initiator and also sends key
-      // For simplicity, we always send our key when connecting
     } catch (error) {
       console.error('Key exchange error:', error);
-      this.config.onError?.('Lỗi khởi tạo mã hóa');
-    }
-  }
-
-  async sendPublicKey() {
-    if (!this.myKeyPair) {
-      await this.performKeyExchange();
     }
   }
 
@@ -152,24 +418,21 @@ class P2PService {
     try {
       const keyBuffer = new Uint8Array(keyData).buffer;
       const peerPublicKey = await importPublicKey(keyBuffer);
-      this.sharedKey = await deriveSharedKey(
-        this.myKeyPair!.privateKey,
-        peerPublicKey
-      );
+      this.sharedKey = await deriveSharedKey(this.myKeyPair!.privateKey, peerPublicKey);
       console.log('Shared key established');
     } catch (error) {
       console.error('Key exchange error:', error);
-      this.config.onError?.('Lỗi thiết lập khóa mã hóa');
     }
   }
 
-  send(message: PeerMessage) {
-    if (this.connection?.open) {
-      this.connection.send(message);
+  private sendViaDataChannel(message: PeerMessage) {
+    const channel = this.dataChannel || this.remoteDataChannel;
+    if (channel && channel.readyState === 'open') {
+      channel.send(JSON.stringify(message));
     }
   }
 
-  private async handleMessage(message: PeerMessage) {
+  private async handleDataMessage(message: PeerMessage) {
     switch (message.type) {
       case 'text':
         if (message.text?.startsWith('key_exchange:')) {
@@ -178,9 +441,8 @@ class P2PService {
             .split(',')
             .map(Number);
           await this.handleKeyExchange(keyData);
-          // Respond with our key if we haven't already
           if (!this.sharedKey) {
-            await this.sendPublicKey();
+            await this.performKeyExchange();
           }
         }
         break;
@@ -194,9 +456,6 @@ class P2PService {
               name: message.fileName,
               size: message.fileSize,
               type: message.fileType || 'application/octet-stream',
-              progress: 0,
-              speed: 0,
-              status: 'transferring',
             },
           });
         }
@@ -207,7 +466,6 @@ class P2PService {
           const fileData = this.fileChunks.get(message.fileId);
           if (fileData) {
             try {
-              // Decrypt chunk
               const encryptedData: EncryptedData = {
                 ciphertext: message.chunk,
                 iv: new Uint8Array(message.iv || new ArrayBuffer(0)),
@@ -221,17 +479,8 @@ class P2PService {
               }
 
               fileData.chunks.push(decryptedChunk);
-
-              // Calculate progress
-              const progress =
-                (fileData.chunks.length / (message.totalChunks || 1)) * 100;
-              fileData.meta.progress = progress;
-
-              this.config.onFileProgress?.(
-                message.fileId!,
-                progress,
-                0
-              );
+              const progress = (fileData.chunks.length / (message.totalChunks || 1)) * 100;
+              this.callbacks.onFileProgress?.(message.fileId!, progress, 0);
             } catch (error) {
               console.error('Decryption error:', error);
             }
@@ -255,19 +504,88 @@ class P2PService {
     const blob = new Blob(chunks, { type: meta.type });
     const file = new File([blob], meta.name, { type: meta.type });
 
-    this.config.onFileComplete?.(fileId, file);
+    this.callbacks.onFileComplete?.(fileId, file);
     this.fileChunks.delete(fileId);
   }
 
-  async sendFile(file: File): Promise<string> {
+  /**
+   * Gửi file(s) - hỗ trợ folder, ảnh, Google Drive
+   */
+  async sendFiles(items: (File | DataTransferItem)[]): Promise<string[]> {
+    const fileIds: string[] = [];
+
+    for (const item of items) {
+      let file: File | null = null;
+
+      if (item instanceof DataTransferItem) {
+        if (item.kind === 'file') {
+          file = item.getAsFile();
+          if (item.webkitGetAsEntry) {
+            const entry = item.webkitGetAsEntry();
+            if (entry?.isDirectory) {
+              const dirFiles = await this.readDirectory(entry as FileSystemDirectoryEntry);
+              for (const dirFile of dirFiles) {
+                const id = await this.sendSingleFile(dirFile);
+                fileIds.push(id);
+              }
+              continue;
+            }
+          }
+        }
+      } else if (item instanceof File) {
+        file = item;
+      }
+
+      if (file) {
+        const id = await this.sendSingleFile(file);
+        fileIds.push(id);
+      }
+    }
+
+    return fileIds;
+  }
+
+  private async readDirectory(dirEntry: FileSystemDirectoryEntry): Promise<File[]> {
+    const files: File[] = [];
+
+    return new Promise((resolve, reject) => {
+      const reader = dirEntry.createReader();
+
+      const readEntries = () => {
+        reader.readEntries(async (entries) => {
+          for (const entry of entries) {
+            if (entry.isFile) {
+              const file = await this.getFileFromEntry(entry as FileSystemFileEntry);
+              if (file) files.push(file);
+            } else if (entry.isDirectory) {
+              const subFiles = await this.readDirectory(entry as FileSystemDirectoryEntry);
+              files.push(...subFiles);
+            }
+          }
+
+          if (entries.length === 0) {
+            resolve(files);
+          } else {
+            readEntries();
+          }
+        }, reject);
+      };
+
+      readEntries();
+    });
+  }
+
+  private getFileFromEntry(entry: FileSystemFileEntry): Promise<File | null> {
+    return new Promise((resolve) => {
+      entry.file((file) => resolve(file), () => resolve(null));
+    });
+  }
+
+  private async sendSingleFile(file: File): Promise<string> {
     const fileId = generateFileId();
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    let sentChunks = 0;
-    let lastTime = Date.now();
-    let lastBytes = 0;
 
-    // Send file metadata
-    this.send({
+    this.sendViaDataChannel({
       type: 'file-meta',
       fileId,
       fileName: file.name,
@@ -275,8 +593,8 @@ class P2PService {
       fileType: file.type,
     });
 
-    // Read and send chunks
     const arrayBuffer = await file.arrayBuffer();
+    let lastTime = Date.now();
 
     for (let i = 0; i < totalChunks; i++) {
       const start = i * CHUNK_SIZE;
@@ -289,71 +607,78 @@ class P2PService {
       if (this.sharedKey) {
         const encrypted = await encryptData(chunk, this.sharedKey);
         encryptedChunk = encrypted.ciphertext;
-        iv = encrypted.iv;
+        iv = encrypted.iv as Uint8Array;
       } else {
         encryptedChunk = chunk;
       }
 
-      this.send({
+      const chunkArray = new Uint8Array(encryptedChunk);
+
+      this.sendViaDataChannel({
         type: 'file-chunk',
         fileId,
-        chunk: encryptedChunk,
+        chunk: chunkArray.buffer as ArrayBuffer,
         iv: Array.from(iv),
         chunkIndex: i,
         totalChunks,
       });
 
-      sentChunks++;
-
-      // Calculate speed
+      const progress = ((i + 1) / totalChunks) * 100;
       const now = Date.now();
       const elapsed = (now - lastTime) / 1000;
+      let speed = 0;
       if (elapsed >= 0.5) {
-        const bytesPerSecond = (sentChunks * CHUNK_SIZE - lastBytes) / elapsed;
-        this.config.onFileProgress?.(fileId, (sentChunks / totalChunks) * 100, bytesPerSecond);
+        speed = ((i + 1) * CHUNK_SIZE) / elapsed;
         lastTime = now;
-        lastBytes = sentChunks * CHUNK_SIZE;
       }
 
-      // Small delay to prevent overwhelming the connection
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      this.callbacks.onFileProgress?.(fileId, progress, speed);
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    // Send completion message
-    this.send({
-      type: 'file-complete',
-      fileId,
-    });
+    this.sendViaDataChannel({ type: 'file-complete', fileId });
 
     return fileId;
   }
 
   disconnect() {
-    if (this.connection) {
-      this.connection.close();
-      this.connection = null;
+    if (this.dataChannel) {
+      this.dataChannel.close();
+      this.dataChannel = null;
     }
+    if (this.pc) {
+      this.pc.close();
+      this.pc = null;
+    }
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
+    this.isConnected = false;
+    this.isInitiatingConnection = false;
+    this.pendingIceCandidates = [];
+    this.peerInfo = null;
+    this.callbacks.onDisconnect?.();
   }
 
   destroy() {
     this.disconnect();
-    if (this.peer) {
-      this.peer.destroy();
-      this.peer = null;
-    }
     this.myKeyPair = null;
     this.sharedKey = null;
     this.fileChunks.clear();
+    this.isInitiatingConnection = false;
+    this.pendingIceCandidates = [];
   }
 
-  isConnected(): boolean {
-    return this.connection?.open ?? false;
+  isPeerConnected(): boolean {
+    return this.isConnected;
   }
 
-  getPeerId(): string | null {
-    return this.peer?.id ?? null;
+  getMySocketId(): string | null {
+    return this.mySocketId;
   }
 }
 
-export const p2pService = new P2PService();
+export const p2pService = new RoomBasedService();
 export default p2pService;
