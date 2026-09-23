@@ -85,7 +85,7 @@ class RoomBasedService {
         }
       };
 
-      this.socket!.addEventListener('message', handler);
+      this.socket!.addEventListener('message', handler, { once: true });
 
       this.sendSignaling({ type: 'create-room' });
     });
@@ -127,7 +127,7 @@ class RoomBasedService {
         }
       };
 
-      this.socket!.addEventListener('message', handler, { once: false });
+      this.socket!.addEventListener('message', handler, { once: true });
 
       setTimeout(() => {
         this.sendSignaling({ type: 'join-room', roomCode });
@@ -136,7 +136,16 @@ class RoomBasedService {
   }
 
   private connectSignaling() {
-    if (this.socket) return;
+    // Already connected and open
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    // Close existing socket if not open
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
 
     this.callbacks.onStatusChange?.('connecting');
 
@@ -152,17 +161,24 @@ class RoomBasedService {
     };
 
     this.socket.onerror = () => {
+      console.error('WebSocket error');
       this.callbacks.onError?.('Không thể kết nối signaling server. Hãy chạy: cd server && npm start');
     };
 
-    this.socket.onclose = () => {
-      this.callbacks.onDisconnect?.();
+    this.socket.onclose = (event) => {
+      console.log('WebSocket closed:', event.code, event.reason);
+      // Only trigger disconnect if we were actually connected
+      if (this.isConnected || this.isInitiatingConnection) {
+        this.callbacks.onDisconnect?.();
+      }
     };
   }
 
   private sendSignaling(message: any) {
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(message));
+    } else {
+      console.warn('Cannot send signaling message - socket not open:', this.socket?.readyState);
     }
   }
 
@@ -207,31 +223,19 @@ class RoomBasedService {
   private setupPeerConnection() {
     this.pc = new RTCPeerConnection({
       iceServers: [
+        // STUN servers
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:stun3.l.google.com:19302' },
         { urls: 'stun:stun4.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        // Open Relay Project - free TURN servers for NAT traversal
-        {
-          urls: 'turn:openrelay.metered.ca:80',
-          username: 'openrelayproject',
-          credential: 'openrelayproject',
-        },
-        {
-          urls: 'turn:openrelay.metered.ca:443',
-          username: 'openrelayproject',
-          credential: 'openrelayproject',
-        },
-        {
-          urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-          username: 'openrelayproject',
-          credential: 'openrelayproject',
-        },
+        // TURN - free relay (TCP fallback works through firewalls)
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
       ],
       iceCandidatePoolSize: 10,
-      iceTransportPolicy: 'all',
+      iceTransportPolicy: 'relay', // Prefer relay to avoid NAT issues
       bundlePolicy: 'max-bundle',
     });
 
@@ -241,6 +245,7 @@ class RoomBasedService {
           console.log('ICE candidate:', event.candidate.candidate);
           this.sendSignaling({
             type: 'ice-candidate',
+            fromSocketId: this.mySocketId,
             targetSocketId: this.peerInfo.socketId,
             candidate: event.candidate,
           });
@@ -249,6 +254,7 @@ class RoomBasedService {
           console.log('ICE gathering complete');
           this.sendSignaling({
             type: 'ice-candidate-complete',
+            fromSocketId: this.mySocketId,
             targetSocketId: this.peerInfo.socketId,
           });
         }
@@ -268,7 +274,8 @@ class RoomBasedService {
     this.pc.oniceconnectionstatechange = () => {
       console.log('ICE connection state:', this.pc?.iceConnectionState);
       if (this.pc?.iceConnectionState === 'failed') {
-        console.error('ICE connection failed - check NAT/firewall');
+        console.error('ICE connection failed - attempting restart');
+        this.restartConnection();
       }
     };
 
@@ -279,9 +286,12 @@ class RoomBasedService {
         this.isConnected = true;
         this.callbacks.onConnection?.();
         this.callbacks.onStatusChange?.('connected');
-      } else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+      } else if (state === 'failed') {
+        console.log('Connection failed - will retry...');
+        // Don't call onDisconnect - we want to retry
+        setTimeout(() => this.restartConnection(), 2000);
+      } else if (state === 'disconnected' || state === 'closed') {
         this.isConnected = false;
-        this.callbacks.onDisconnect?.();
       }
     };
 
@@ -312,15 +322,43 @@ class RoomBasedService {
       const offer = await this.pc!.createOffer();
       await this.pc!.setLocalDescription(offer);
 
+      console.log('Sending offer to:', this.peerInfo!.socketId);
       this.sendSignaling({
         type: 'offer',
+        fromSocketId: this.mySocketId,
         targetSocketId: this.peerInfo!.socketId,
         offer: this.pc!.localDescription,
       });
     }
   }
 
+  private restartConnection() {
+    if (!this.peerInfo || !this.mySocketId) {
+      console.log('Cannot restart - no peer info');
+      return;
+    }
+
+    console.log('Restarting connection...');
+
+    // Close existing PC
+    if (this.pc) {
+      this.pc.close();
+      this.pc = null;
+    }
+
+    // Reset state
+    this.isInitiatingConnection = false;
+    this.dataChannel = null;
+    this.remoteDataChannel = null;
+
+    // Restart as offerer if host
+    if (this.isHost) {
+      this.startConnection(true);
+    }
+  }
+
   private async handleOffer(offer: RTCSessionDescriptionInit, fromSocketId: string) {
+    console.log('handleOffer received from:', fromSocketId);
     this.setupPeerConnection();
 
     await this.pc!.setRemoteDescription(offer);
@@ -331,14 +369,17 @@ class RoomBasedService {
     const answer = await this.pc!.createAnswer();
     await this.pc!.setLocalDescription(answer);
 
+    console.log('Sending answer to:', fromSocketId);
     this.sendSignaling({
       type: 'answer',
+      fromSocketId: this.mySocketId,
       targetSocketId: fromSocketId,
       answer: this.pc!.localDescription,
     });
   }
 
   private async handleAnswer(answer: RTCSessionDescriptionInit) {
+    console.log('handleAnswer received');
     await this.pc!.setRemoteDescription(answer);
     // Process any pending ICE candidates after setting remote description
     await this.processPendingIceCandidates();
